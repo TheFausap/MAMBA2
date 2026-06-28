@@ -43,7 +43,7 @@ def parse_args():
     parser.add_argument("--eval_interval", type=int, default=1000)
     parser.add_argument("--generate_interval", type=int, default=1000)
     parser.add_argument("--generate_max_new_tokens", type=int, default=80)
-    parser.add_argument("--generate_prompt", type=str, default="Once upon a time")
+    parser.add_argument("--generate_prompt", type=str, default="The future of Artificial Intelligence")
     parser.add_argument("--best_checkpoint_path", type=str, default="mamba_best.pt")
     parser.add_argument("--final_checkpoint_path", type=str, default="mamba_final.pt")
     parser.add_argument("--tokenized_dataset_dir", type=str, default=None)
