@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import argparse
+import math
 
 import torch
 import torch.nn.functional as F
@@ -24,6 +25,9 @@ def parse_args():
     parser.add_argument("--tok_max_len", type=int, default=128, help="max token length or context length if streaming is on")
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--min_lr", type=float, default=1e-5)
+    parser.add_argument("--warmup_tokens", type=int, default=100_000)
+    parser.add_argument("--lr_schedule", choices=["constant", "cosine"], default="cosine")
 
     parser.add_argument("--dataset", type=str, default="HuggingFaceTB/dclm-edu")
     parser.add_argument("--split", type=str, default="train")
@@ -169,6 +173,25 @@ def compute_loss(logits, labels):
     return F.cross_entropy(logits, labels, ignore_index=-100)
 
 
+def get_learning_rate(args, consumed_tokens):
+    if args.lr_schedule == "constant":
+        return args.lr
+
+    if args.warmup_tokens > 0 and consumed_tokens < args.warmup_tokens:
+        return args.lr * consumed_tokens / args.warmup_tokens
+
+    decay_tokens = max(args.max_tokens - args.warmup_tokens, 1)
+    decay_progress = (consumed_tokens - args.warmup_tokens) / decay_tokens
+    decay_progress = min(max(decay_progress, 0), 1)
+    cosine_decay = 0.5 * (1 + math.cos(math.pi * decay_progress))
+    return args.min_lr + (args.lr - args.min_lr) * cosine_decay
+
+
+def set_learning_rate(optimizer, learning_rate):
+    for param_group in optimizer.param_groups:
+        param_group["lr"] = learning_rate
+
+
 def forward_loss(model, batch, device):
     input_ids = batch["input_ids"].to(device)
     labels = batch["labels"].to(device)
@@ -264,6 +287,8 @@ def train_streaming(args, model, optimizer, train_loader, eval_loader, tokenizer
 
     for step, batch in enumerate(train_loader, start=1):
         loss, valid_tokens = forward_loss(model, batch, device)
+        learning_rate = get_learning_rate(args, consumed_tokens + valid_tokens)
+        set_learning_rate(optimizer, learning_rate)
 
         optimizer.zero_grad()
         loss.backward()
@@ -277,7 +302,7 @@ def train_streaming(args, model, optimizer, train_loader, eval_loader, tokenizer
             avg_loss = running_loss / max(running_batches, 1)
             print(
                 f"Step {step} | Tokens {consumed_tokens}/{args.max_tokens} | "
-                f"Train Loss: {avg_loss:.4f}"
+                f"LR: {learning_rate:.2e} | Train Loss: {avg_loss:.4f}"
             )
             running_loss = 0
             running_batches = 0
@@ -331,6 +356,8 @@ def train_cached(args, model, optimizer, train_loader, eval_loader, tokenizer, d
         for step, batch in enumerate(train_loader, start=1):
             global_step += 1
             loss, valid_tokens = forward_loss(model, batch, device)
+            learning_rate = get_learning_rate(args, consumed_tokens + valid_tokens)
+            set_learning_rate(optimizer, learning_rate)
 
             optimizer.zero_grad()
             loss.backward()
@@ -344,7 +371,8 @@ def train_cached(args, model, optimizer, train_loader, eval_loader, tokenizer, d
                 avg_train_loss = running_train_loss / args.log_interval
                 print(
                     f"Epoch {epoch + 1} | Step {step}/{len(train_loader)} | "
-                    f"Tokens {consumed_tokens} | Train Loss: {avg_train_loss:.4f}"
+                    f"Tokens {consumed_tokens} | LR: {learning_rate:.2e} | "
+                    f"Train Loss: {avg_train_loss:.4f}"
                 )
                 running_train_loss = 0
 
