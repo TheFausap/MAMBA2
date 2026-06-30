@@ -2,15 +2,71 @@ from pathlib import Path
 
 import argparse
 import math
+import os
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 import torch.optim as optim
 from datasets import load_dataset, load_from_disk
+from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, IterableDataset
+from torch.utils.data.distributed import DistributedSampler
 from transformers import AutoTokenizer
 
 from mamba_model import Mamba
+
+
+def setup_distributed(args):
+    rank = int(os.environ.get("RANK", "0"))
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    distributed = args.ddp and world_size > 1
+
+    if distributed:
+        backend = args.ddp_backend or ("nccl" if torch.cuda.is_available() else "gloo")
+        if torch.cuda.is_available():
+            torch.cuda.set_device(local_rank)
+        dist.init_process_group(backend=backend)
+
+    args.rank = rank
+    args.world_size = world_size
+    args.local_rank = local_rank
+    args.distributed = distributed
+    args.is_main = rank == 0
+    return args
+
+
+def cleanup_distributed(args):
+    if args.distributed and dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def get_device(args):
+    if torch.cuda.is_available():
+        return torch.device("cuda", args.local_rank if args.distributed else 0)
+    return torch.device("cpu")
+
+
+def main_print(args, *values):
+    if args.is_main:
+        print(*values)
+
+
+def distributed_barrier(args):
+    if args.distributed and dist.is_initialized():
+        dist.barrier()
+
+
+def unwrap_model(model):
+    return model.module if hasattr(model, "module") else model
+
+
+def clean_state_dict_keys(state_dict):
+    return {
+        key.removeprefix("module."): value
+        for key, value in state_dict.items()
+    }
 
 
 def parse_args():
@@ -47,6 +103,9 @@ def parse_args():
     parser.add_argument("--best_checkpoint_path", type=str, default="mamba_best.pt")
     parser.add_argument("--final_checkpoint_path", type=str, default="mamba_final.pt")
     parser.add_argument("--tokenized_dataset_dir", type=str, default=None)
+    parser.add_argument("--resume_from", type=str, default=None)
+    parser.add_argument("--ddp", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--ddp_backend", choices=["nccl", "gloo"], default=None)
 
     return parser.parse_args()
 
@@ -89,6 +148,18 @@ class PackedTextDataset(IterableDataset):
                 }
 
 
+class ShardedExamples(IterableDataset):
+    def __init__(self, examples, rank, world_size):
+        self.examples = examples
+        self.rank = rank
+        self.world_size = world_size
+
+    def __iter__(self):
+        for index, example in enumerate(self.examples):
+            if index % self.world_size == self.rank:
+                yield example
+
+
 def tokenize_padded_example(example, tokenizer, text_column, max_length):
     if text_column not in example:
         available_columns = ", ".join(example.keys())
@@ -116,7 +187,7 @@ def build_streaming_loaders(args, tokenizer):
     if args.max_tokens <= 0:
         raise ValueError("--max_tokens must be positive in streaming mode")
 
-    if args.eval_examples > 0:
+    if args.is_main and args.eval_examples > 0:
         eval_stream = load_dataset(args.dataset, split=args.split, streaming=True).take(args.eval_examples)
         eval_dataset = PackedTextDataset(eval_stream, tokenizer, args.text_column, args.tok_max_len)
         eval_loader = DataLoader(eval_dataset, batch_size=args.batch_size, shuffle=False)
@@ -128,6 +199,9 @@ def build_streaming_loaders(args, tokenizer):
         train_stream = train_stream.skip(args.eval_examples)
     if args.shuffle_buffer > 0:
         train_stream = train_stream.shuffle(buffer_size=args.shuffle_buffer, seed=args.seed)
+
+    if args.distributed:
+        train_stream = ShardedExamples(train_stream, args.rank, args.world_size)
 
     train_dataset = PackedTextDataset(train_stream, tokenizer, args.text_column, args.tok_max_len)
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=False)
@@ -143,18 +217,24 @@ def build_cached_loaders(args, tokenizer):
     tokenized_dataset_dir = Path(dataset_cache_dir)
 
     if tokenized_dataset_dir.exists():
-        print(f"Loading tokenized dataset from {tokenized_dataset_dir}...")
+        main_print(args, f"Loading tokenized dataset from {tokenized_dataset_dir}...")
         dataset = load_from_disk(str(tokenized_dataset_dir))
     else:
-        print(f"Loading dataset {args.dataset!r} from Hugging Face...")
-        dataset = load_dataset(args.dataset, split=args.split)
-        print(f"Tokenizing dataset and saving to {tokenized_dataset_dir}...")
-        dataset = dataset.map(
-            lambda example: tokenize_padded_example(example, tokenizer, args.text_column, args.tok_max_len),
-            batched=False,
-            remove_columns=dataset.column_names,
-        )
-        dataset.save_to_disk(str(tokenized_dataset_dir))
+        if args.distributed and not args.is_main:
+            dist.barrier()
+            dataset = load_from_disk(str(tokenized_dataset_dir))
+        else:
+            main_print(args, f"Loading dataset {args.dataset!r} from Hugging Face...")
+            dataset = load_dataset(args.dataset, split=args.split)
+            main_print(args, f"Tokenizing dataset and saving to {tokenized_dataset_dir}...")
+            dataset = dataset.map(
+                lambda example: tokenize_padded_example(example, tokenizer, args.text_column, args.tok_max_len),
+                batched=False,
+                remove_columns=dataset.column_names,
+            )
+            dataset.save_to_disk(str(tokenized_dataset_dir))
+            if args.distributed:
+                dist.barrier()
 
     dataset.set_format(type="torch", columns=["input_ids", "labels"])
 
@@ -162,8 +242,26 @@ def build_cached_loaders(args, tokenizer):
     train_dataset = dataset.select(range(split_index))
     eval_dataset = dataset.select(range(split_index, len(dataset)))
 
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
-    eval_loader = DataLoader(eval_dataset, batch_size=args.batch_size, shuffle=False)
+    train_sampler = None
+    if args.distributed:
+        train_sampler = DistributedSampler(
+            train_dataset,
+            num_replicas=args.world_size,
+            rank=args.rank,
+            shuffle=True,
+            seed=args.seed,
+        )
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        shuffle=train_sampler is None,
+        sampler=train_sampler,
+    )
+    if args.is_main:
+        eval_loader = DataLoader(eval_dataset, batch_size=args.batch_size, shuffle=False)
+    else:
+        eval_loader = None
     return train_loader, eval_loader
 
 
@@ -192,6 +290,15 @@ def set_learning_rate(optimizer, learning_rate):
         param_group["lr"] = learning_rate
 
 
+def reduce_token_count(valid_tokens, device, args):
+    if not args.distributed:
+        return valid_tokens
+
+    token_tensor = torch.tensor(valid_tokens, dtype=torch.long, device=device)
+    dist.all_reduce(token_tensor, op=dist.ReduceOp.SUM)
+    return int(token_tensor.item())
+
+
 def forward_loss(model, batch, device):
     input_ids = batch["input_ids"].to(device)
     labels = batch["labels"].to(device)
@@ -204,11 +311,25 @@ def forward_loss(model, batch, device):
     return loss, valid_tokens
 
 
+def load_checkpoint(model, path, device, args):
+    if path is None:
+        return
+
+    checkpoint = torch.load(path, map_location=device)
+    state_dict = checkpoint.get("model_state_dict", checkpoint) if isinstance(checkpoint, dict) else checkpoint
+    unwrap_model(model).load_state_dict(clean_state_dict_keys(state_dict))
+    main_print(args, f"Loaded checkpoint from {path}")
+
+
+def save_model_checkpoint(model, path):
+    torch.save(unwrap_model(model).state_dict(), path)
+
+
 def save_best_checkpoint(model, eval_loss, best_eval_loss, path):
     if eval_loss >= best_eval_loss:
         return best_eval_loss
 
-    torch.save(model.state_dict(), path)
+    save_model_checkpoint(model, path)
     print(f"Saved best checkpoint to {path} | Eval Loss: {eval_loss:.4f}")
     return eval_loss
 
@@ -217,7 +338,9 @@ def evaluate(model, eval_loader, device, max_batches=None):
     if eval_loader is None:
         return None
 
-    model.eval()
+    eval_model = unwrap_model(model)
+    was_training = eval_model.training
+    eval_model.eval()
     total_eval_loss = 0
     num_batches = 0
 
@@ -226,11 +349,12 @@ def evaluate(model, eval_loader, device, max_batches=None):
             if max_batches is not None and batch_idx >= max_batches:
                 break
 
-            loss, _ = forward_loss(model, batch, device)
+            loss, _ = forward_loss(eval_model, batch, device)
             total_eval_loss += loss.item()
             num_batches += 1
 
-    model.train()
+    if was_training:
+        eval_model.train()
     if num_batches == 0:
         return None
     return total_eval_loss / num_batches
@@ -251,13 +375,15 @@ def sample_next_token(logits, temperature=0.8, top_k=50):
 
 
 def generate_text(model, tokenizer, prompt, device, max_new_tokens=80, context_length=128):
-    model.eval()
+    generation_model = unwrap_model(model)
+    was_training = generation_model.training
+    generation_model.eval()
     input_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
 
     with torch.no_grad():
         for _ in range(max_new_tokens):
             context = input_ids[:, -context_length:]
-            logits = model(context)
+            logits = generation_model(context)
             next_token_logits = logits[:, -1, :]
             next_token = sample_next_token(next_token_logits)
             input_ids = torch.cat([input_ids, next_token], dim=1)
@@ -265,7 +391,8 @@ def generate_text(model, tokenizer, prompt, device, max_new_tokens=80, context_l
             if next_token.item() == tokenizer.eos_token_id:
                 break
 
-    model.train()
+    if was_training:
+        generation_model.train()
     return tokenizer.decode(input_ids[0], skip_special_tokens=True)
 
 
@@ -287,18 +414,19 @@ def train_streaming(args, model, optimizer, train_loader, eval_loader, tokenizer
 
     for step, batch in enumerate(train_loader, start=1):
         loss, valid_tokens = forward_loss(model, batch, device)
-        learning_rate = get_learning_rate(args, consumed_tokens + valid_tokens)
+        global_valid_tokens = reduce_token_count(valid_tokens, device, args)
+        learning_rate = get_learning_rate(args, consumed_tokens + global_valid_tokens)
         set_learning_rate(optimizer, learning_rate)
 
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
 
-        consumed_tokens += valid_tokens
+        consumed_tokens += global_valid_tokens
         running_loss += loss.item()
         running_batches += 1
 
-        if step % args.log_interval == 0:
+        if args.is_main and step % args.log_interval == 0:
             avg_loss = running_loss / max(running_batches, 1)
             print(
                 f"Step {step} | Tokens {consumed_tokens}/{args.max_tokens} | "
@@ -307,7 +435,7 @@ def train_streaming(args, model, optimizer, train_loader, eval_loader, tokenizer
             running_loss = 0
             running_batches = 0
 
-        if eval_loader is not None and step % args.eval_interval == 0:
+        if args.is_main and eval_loader is not None and step % args.eval_interval == 0:
             eval_loss = evaluate(model, eval_loader, device, max_batches=args.eval_max_batches)
             print_eval_result(step, eval_loss, args.eval_max_batches)
             if eval_loss is not None:
@@ -318,7 +446,7 @@ def train_streaming(args, model, optimizer, train_loader, eval_loader, tokenizer
                     args.best_checkpoint_path,
                 )
 
-        if step % args.generate_interval == 0:
+        if args.is_main and step % args.generate_interval == 0:
             sample = generate_text(
                 model,
                 tokenizer,
@@ -334,11 +462,13 @@ def train_streaming(args, model, optimizer, train_loader, eval_loader, tokenizer
         if consumed_tokens >= args.max_tokens:
             break
 
-    eval_loss = evaluate(model, eval_loader, device, max_batches=args.eval_max_batches)
-    print_eval_result(step, eval_loss, args.eval_max_batches)
-    if eval_loss is not None:
-        best_eval_loss = save_best_checkpoint(model, eval_loss, best_eval_loss, args.best_checkpoint_path)
+    if args.is_main:
+        eval_loss = evaluate(model, eval_loader, device, max_batches=args.eval_max_batches)
+        print_eval_result(step, eval_loss, args.eval_max_batches)
+        if eval_loss is not None:
+            best_eval_loss = save_best_checkpoint(model, eval_loss, best_eval_loss, args.best_checkpoint_path)
 
+    distributed_barrier(args)
     return best_eval_loss, consumed_tokens, step
 
 
@@ -349,6 +479,9 @@ def train_cached(args, model, optimizer, train_loader, eval_loader, tokenizer, d
     model.train()
 
     for epoch in range(args.epoch):
+        if args.distributed and hasattr(train_loader.sampler, "set_epoch"):
+            train_loader.sampler.set_epoch(epoch)
+
         model.train()
         total_train_loss = 0
         running_train_loss = 0
@@ -356,18 +489,19 @@ def train_cached(args, model, optimizer, train_loader, eval_loader, tokenizer, d
         for step, batch in enumerate(train_loader, start=1):
             global_step += 1
             loss, valid_tokens = forward_loss(model, batch, device)
-            learning_rate = get_learning_rate(args, consumed_tokens + valid_tokens)
+            global_valid_tokens = reduce_token_count(valid_tokens, device, args)
+            learning_rate = get_learning_rate(args, consumed_tokens + global_valid_tokens)
             set_learning_rate(optimizer, learning_rate)
 
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
-            consumed_tokens += valid_tokens
+            consumed_tokens += global_valid_tokens
             total_train_loss += loss.item()
             running_train_loss += loss.item()
 
-            if step % args.log_interval == 0:
+            if args.is_main and step % args.log_interval == 0:
                 avg_train_loss = running_train_loss / args.log_interval
                 print(
                     f"Epoch {epoch + 1} | Step {step}/{len(train_loader)} | "
@@ -376,7 +510,7 @@ def train_cached(args, model, optimizer, train_loader, eval_loader, tokenizer, d
                 )
                 running_train_loss = 0
 
-            if step % args.eval_interval == 0:
+            if args.is_main and step % args.eval_interval == 0:
                 eval_loss = evaluate(model, eval_loader, device, max_batches=args.eval_max_batches)
                 print_eval_result(global_step, eval_loss, args.eval_max_batches)
                 if eval_loss is not None:
@@ -387,7 +521,7 @@ def train_cached(args, model, optimizer, train_loader, eval_loader, tokenizer, d
                         args.best_checkpoint_path,
                     )
 
-            if step % args.generate_interval == 0:
+            if args.is_main and step % args.generate_interval == 0:
                 sample = generate_text(
                     model,
                     tokenizer,
@@ -400,72 +534,93 @@ def train_cached(args, model, optimizer, train_loader, eval_loader, tokenizer, d
                 print(sample)
                 print("-" * 80)
 
-        eval_loss = evaluate(model, eval_loader, device)
-        avg_epoch_loss = total_train_loss / max(len(train_loader), 1)
-        if eval_loss is None:
-            print(f"Epoch {epoch + 1} | Train Loss: {avg_epoch_loss:.4f} | Eval skipped")
-        else:
-            print(f"Epoch {epoch + 1} | Train Loss: {avg_epoch_loss:.4f} | Eval Loss: {eval_loss:.4f}")
-            best_eval_loss = save_best_checkpoint(model, eval_loss, best_eval_loss, args.best_checkpoint_path)
+        if args.is_main:
+            eval_loss = evaluate(model, eval_loader, device)
+            avg_epoch_loss = total_train_loss / max(len(train_loader), 1)
+            if eval_loss is None:
+                print(f"Epoch {epoch + 1} | Train Loss: {avg_epoch_loss:.4f} | Eval skipped")
+            else:
+                print(f"Epoch {epoch + 1} | Train Loss: {avg_epoch_loss:.4f} | Eval Loss: {eval_loss:.4f}")
+                best_eval_loss = save_best_checkpoint(model, eval_loss, best_eval_loss, args.best_checkpoint_path)
 
+    distributed_barrier(args)
     return best_eval_loss, consumed_tokens, global_step
 
 
 def main():
     args = parse_args()
-    torch.manual_seed(args.seed)
+    setup_distributed(args)
+    torch.manual_seed(args.seed + args.rank)
 
-    tokenizer = AutoTokenizer.from_pretrained("gpt2")
-    tokenizer.pad_token = tokenizer.eos_token
+    try:
+        tokenizer = AutoTokenizer.from_pretrained("gpt2")
+        tokenizer.pad_token = tokenizer.eos_token
 
-    if args.streaming:
-        train_loader, eval_loader = build_streaming_loaders(args, tokenizer)
-    else:
-        train_loader, eval_loader = build_cached_loaders(args, tokenizer)
+        if args.streaming:
+            train_loader, eval_loader = build_streaming_loaders(args, tokenizer)
+        else:
+            train_loader, eval_loader = build_cached_loaders(args, tokenizer)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        device = get_device(args)
 
-    model = Mamba(
-        vocab_size=len(tokenizer),
-        d_model=args.d_model,
-        num_blocks=args.block,
-        d_inner=args.d_model * 8,
-        d_state=args.state,
-        d_conv=args.conv,
-        dropout=args.dropout,
-    ).to(device)
+        model = Mamba(
+            vocab_size=len(tokenizer),
+            d_model=args.d_model,
+            num_blocks=args.block,
+            d_inner=args.d_model * 8,
+            d_state=args.state,
+            d_conv=args.conv,
+            dropout=args.dropout,
+        ).to(device)
 
-    optimizer = optim.AdamW(model.parameters(), lr=args.lr)
+        if args.resume_from is not None and (args.is_main or not args.distributed):
+            load_checkpoint(model, args.resume_from, device, args)
 
-    if args.streaming:
-        best_eval_loss, consumed_tokens, steps = train_streaming(
-            args,
-            model,
-            optimizer,
-            train_loader,
-            eval_loader,
-            tokenizer,
-            device,
-        )
-    else:
-        best_eval_loss, consumed_tokens, steps = train_cached(
-            args,
-            model,
-            optimizer,
-            train_loader,
-            eval_loader,
-            tokenizer,
-            device,
-        )
+        if args.distributed:
+            if torch.cuda.is_available():
+                model = DistributedDataParallel(
+                    model,
+                    device_ids=[args.local_rank],
+                    output_device=args.local_rank,
+                    broadcast_buffers=False,
+                )
+            else:
+                model = DistributedDataParallel(model, broadcast_buffers=False)
 
-    torch.save(model.state_dict(), args.final_checkpoint_path)
-    print(f"Saved final checkpoint to {args.final_checkpoint_path}")
-    best_eval_message = f"{best_eval_loss:.4f}" if best_eval_loss < float("inf") else "n/a"
-    print(
-        f"Best eval loss: {best_eval_message} | Best checkpoint: {args.best_checkpoint_path} | "
-        f"Steps: {steps} | Train tokens: {consumed_tokens}"
-    )
-    print("Training complete.")
+        optimizer = optim.AdamW(model.parameters(), lr=args.lr)
+
+        if args.streaming:
+            best_eval_loss, consumed_tokens, steps = train_streaming(
+                args,
+                model,
+                optimizer,
+                train_loader,
+                eval_loader,
+                tokenizer,
+                device,
+            )
+        else:
+            best_eval_loss, consumed_tokens, steps = train_cached(
+                args,
+                model,
+                optimizer,
+                train_loader,
+                eval_loader,
+                tokenizer,
+                device,
+            )
+
+        if args.is_main:
+            save_model_checkpoint(model, args.final_checkpoint_path)
+            print(f"Saved final checkpoint to {args.final_checkpoint_path}")
+            best_eval_message = f"{best_eval_loss:.4f}" if best_eval_loss < float("inf") else "n/a"
+            print(
+                f"Best eval loss: {best_eval_message} | Best checkpoint: {args.best_checkpoint_path} | "
+                f"Steps: {steps} | Train tokens: {consumed_tokens}"
+            )
+            print("Training complete.")
+    finally:
+        cleanup_distributed(args)
 
 
 if __name__ == "__main__":
